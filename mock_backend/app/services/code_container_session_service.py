@@ -24,6 +24,7 @@ try:
         ResourceRequests,
         ResourceRequirements,
         OperatingSystemTypes,
+        ImageRegistryCredential,
     )
     AZURE_SDK_AVAILABLE = True
 except ImportError:
@@ -55,8 +56,18 @@ class CodeContainerSessionService:
         resource_group = settings.AZURE_ACI_RESOURCE_GROUP
         location = getattr(settings, "AZURE_ACI_LOCATION", "eastus")
         acr_server = getattr(settings, "AZURE_ACR_SERVER", "")
-        # Use python image as it has standard tools and python3.
-        image = f"{acr_server}/code-runner-python:latest" if acr_server else "code-runner-python:latest"
+        acr_user = getattr(settings, "AZURE_ACR_USERNAME", None)
+        acr_pass = getattr(settings, "AZURE_ACR_PASSWORD", None)
+
+        lang_map = {
+            "python3": "code-runner-python",
+            "javascript": "code-runner-javascript",
+            "java": "code-runner-java",
+            "cpp": "code-runner-cpp",
+        }
+        image_name = lang_map.get(language, "code-runner-python")
+        image_base = f"{acr_server}/{image_name}:latest" if acr_server else f"{image_name}:latest"
+        image = image_base
 
         cg_name = f"code-runner-{interview_id}"
         container_name = "runner"
@@ -77,18 +88,29 @@ class CodeContainerSessionService:
             name=container_name,
             image=image,
             resources=ResourceRequirements(requests=ResourceRequests(memory_in_gb=1.0, cpu=1.0)),
-            command=["sh", "-c", "while true; do sleep 60; done"],
+            command=["timeout", "45m", "bash", "-c", "while true; do sleep 60; done"],
         )
 
         import datetime
         now_ts = str(datetime.datetime.now(datetime.timezone.utc).timestamp())
         
+        registry_credentials = []
+        if acr_server and acr_user and acr_pass:
+            registry_credentials.append(
+                ImageRegistryCredential(
+                    server=acr_server,
+                    username=acr_user,
+                    password=acr_pass
+                )
+            )
+
         group = ContainerGroup(
             location=location,
             containers=[container_resource],
             os_type=OperatingSystemTypes.linux,
             restart_policy="Never",
-            tags={"creationTime": now_ts}
+            tags={"creationTime": now_ts},
+            image_registry_credentials=registry_credentials if registry_credentials else None
         )
 
         logger.info(f"Creating session container {cg_name}")

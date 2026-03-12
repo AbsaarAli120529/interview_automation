@@ -35,6 +35,7 @@ try:
         ResourceRequests,
         ResourceRequirements,
         OperatingSystemTypes,
+        ImageRegistryCredential,
     )
     AZURE_SDK_AVAILABLE = True
 except ImportError:
@@ -63,7 +64,7 @@ LANGUAGE_CONFIG: dict[str, dict] = {
         "run_cmd": ["python3", "/code/solution.py"],
     },
     "javascript": {
-        "image": "code-runner-node",
+        "image": "code-runner-javascript",
         "filename": "solution.js",
         "compile_cmd": None,
         "run_cmd": ["node", "/code/solution.js"],
@@ -186,6 +187,8 @@ def _execute_code_azure(
     resource_group = settings.AZURE_ACI_RESOURCE_GROUP
     location = getattr(settings, "AZURE_ACI_LOCATION", "eastus")
     acr_server = getattr(settings, "AZURE_ACR_SERVER", "")
+    acr_user = getattr(settings, "AZURE_ACR_USERNAME", None)
+    acr_pass = getattr(settings, "AZURE_ACR_PASSWORD", None)
 
     # For Azure, the image should be pulled from ACR (or a public registry if acr_server is empty)
     img = f"{acr_server}/{config['image']}:latest" if acr_server else f"{config['image']}:latest"
@@ -199,7 +202,7 @@ def _execute_code_azure(
     # Constructing a single bash command to write code, compile (if needed), and run logic
     cmds = [
         "mkdir -p /code",
-        f"echo {src_b64} | base64 -d > /code/{filename}"
+        f"printf '%s' '{src_b64}' | base64 -d > /code/{filename}"
     ]
     if config["compile_cmd"]:
         comp_str = " ".join(config["compile_cmd"])
@@ -208,13 +211,13 @@ def _execute_code_azure(
         
     run_str = " ".join(config["run_cmd"])
     # 5 second timeout required
-    cmds.append(f"echo {std_b64} | base64 -d | timeout 5 {run_str}")
+    cmds.append(f"printf '%s' '{std_b64}' | base64 -d | timeout 5 {run_str}")
     
     full_cmd = " && ".join(cmds)
     
     wrapped_cmd = f"{{ {full_cmd} ; }} ; echo \"__EXIT_CODE__$?\""
     b64_cmd = base64.b64encode(wrapped_cmd.encode("utf-8")).decode("utf-8")
-    final_entrypoint = f"/bin/sh -c 'echo {b64_cmd} | base64 -d | sh'"
+    final_entrypoint = f"/bin/sh -c 'printf \"%s\" \"{b64_cmd}\" | base64 -d | sh'"
     
     if interview_id:
         cg_name = f"code-runner-{interview_id}"
@@ -223,8 +226,16 @@ def _execute_code_azure(
             credential = DefaultAzureCredential()
             client = ContainerInstanceManagementClient(credential, sub_id)
             
+            cg = client.container_groups.get(resource_group, cg_name)
+            if cg.instance_view and cg.instance_view.state != "Running":
+                return {
+                    "stdout": "", "stderr": "", "exit_code": -1, "timed_out": False,
+                    "error": f"Container is not running. State: {cg.instance_view.state}"
+                }
+            
             from azure.mgmt.containerinstance.models import ContainerExecRequest, ContainerExecRequestTerminalSize
             import websockets.sync.client
+            from websockets.exceptions import ConnectionClosed
             import re
             
             exec_req = ContainerExecRequest(
@@ -249,6 +260,10 @@ def _execute_code_azure(
                             if isinstance(msg, bytes):
                                 msg = msg.decode("utf-8")
                             logs += msg
+                        except TimeoutError:
+                            continue
+                        except ConnectionClosed:
+                            break
                         except Exception:
                             break
             except Exception as wse:
@@ -298,11 +313,22 @@ def _execute_code_azure(
                 command=entrypoint,
             )
     
+            registry_credentials = []
+            if acr_server and acr_user and acr_pass:
+                registry_credentials.append(
+                    ImageRegistryCredential(
+                        server=acr_server,
+                        username=acr_user,
+                        password=acr_pass
+                    )
+                )
+
             group = ContainerGroup(
                 location=location,
                 containers=[container_resource],
                 os_type=OperatingSystemTypes.linux,
-                restart_policy="Never" # single execution
+                restart_policy="Never", # single execution
+                image_registry_credentials=registry_credentials if registry_credentials else None
             )
     
             # Deploy container
